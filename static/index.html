@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>图片上传</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            font-family: Arial, "Microsoft YaHei", sans-serif;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: #f6f7fb;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            color: #111827;
+        }
+
+        .panel {
+            width: 100%;
+            max-width: 560px;
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 28px;
+            box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+        }
+
+        h1,
+        h2 {
+            margin: 0;
+        }
+
+        h1 {
+            font-size: 24px;
+        }
+
+        h2 {
+            margin-top: 24px;
+            font-size: 18px;
+        }
+
+        .upload-box,
+        .download-box {
+            margin-top: 14px;
+            border: 1px solid #dbe3ef;
+            border-radius: 8px;
+            padding: 20px;
+            background: #f8fafc;
+        }
+
+        .upload-box {
+            border-style: dashed;
+            border-color: #93c5fd;
+            text-align: center;
+        }
+
+        input[type="file"],
+        select {
+            width: 100%;
+            margin: 12px 0;
+        }
+
+        select {
+            height: 40px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            padding: 0 10px;
+            background: #fff;
+        }
+
+        button,
+        .btn {
+            display: inline-block;
+            border: 0;
+            border-radius: 6px;
+            background: #2563eb;
+            color: #fff;
+            padding: 11px 18px;
+            font-size: 15px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        button:hover,
+        .btn:hover {
+            background: #1d4ed8;
+        }
+
+        .secondary {
+            background: #4b5563;
+        }
+
+        .secondary:hover {
+            background: #374151;
+        }
+
+        .actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 18px;
+        }
+
+        .hint {
+            margin: 8px 0 0;
+            color: #6b7280;
+            font-size: 14px;
+        }
+    </style>
+</head>
+
+<body>
+    <main class="panel">
+        <h1>图片上传</h1>
+
+        <form class="upload-box" action="/upload" method="POST" enctype="multipart/form-data">
+            <input type="file" name="file" accept="image/*" required>
+            <button type="submit">上传图片</button>
+        </form>
+
+        <h2>下载图片</h2>
+        <section class="download-box">
+            <select id="imageSelect">
+                <option value="">正在加载图片列表...</option>
+            </select>
+            <div class="actions">
+                <a id="downloadLink" class="btn" href="#" download>下载选中图片</a>
+                <button class="secondary" type="button" id="refreshButton">刷新列表</button>
+                <a class="btn secondary" href="/logout">退出登录</a>
+            </div>
+            <p class="hint" id="imageHint"></p>
+        </section>
+    </main>
+
+    <script>
+        const select = document.getElementById("imageSelect");
+        const downloadLink = document.getElementById("downloadLink");
+        const refreshButton = document.getElementById("refreshButton");
+        const imageHint = document.getElementById("imageHint");
+
+        function updateDownloadLink() {
+            const option = select.options[select.selectedIndex];
+            const url = option ? option.value : "";
+            downloadLink.href = url || "#";
+            downloadLink.toggleAttribute("aria-disabled", !url);
+        }
+
+        async function loadImages() {
+            select.innerHTML = '<option value="">正在加载图片列表...</option>';
+            imageHint.textContent = "";
+            updateDownloadLink();
+
+            const response = await fetch("/api/images", { cache: "no-store" });
+            const images = await response.json();
+
+            select.innerHTML = "";
+            if (!images.length) {
+                select.innerHTML = '<option value="">暂无可下载图片</option>';
+                imageHint.textContent = "上传图片后可以在这里选择下载。";
+                updateDownloadLink();
+                return;
+            }
+
+            images.forEach((image) => {
+                const option = document.createElement("option");
+                option.value = image.url;
+                option.textContent = image.name;
+                select.appendChild(option);
+            });
+            imageHint.textContent = `共 ${images.length} 张图片`;
+            updateDownloadLink();
+        }
+
+        select.addEventListener("change", updateDownloadLink);
+        refreshButton.addEventListener("click", loadImages);
+        downloadLink.addEventListener("click", (event) => {
+            if (!select.value) {
+                event.preventDefault();
+            }
+        });
+
+        loadImages().catch(() => {
+            select.innerHTML = '<option value="">图片列表加载失败</option>';
+            imageHint.textContent = "请重新登录或稍后刷新。";
+            updateDownloadLink();
+        });
+    </script>
+</body>
+
+</html>

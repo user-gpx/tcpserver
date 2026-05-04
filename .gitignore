@@ -1,0 +1,18 @@
+# build output
+build/
+main
+tools/load_test
+
+# runtime files
+logs/
+uploads/*
+
+# keep upload directory if needed
+!uploads/.gitkeep
+
+# local generated files
+*.o
+*.d
+*.log
+
+.clang-format
