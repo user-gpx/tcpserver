@@ -18,6 +18,7 @@ class ThreadPool {
     std::queue<std::function<void()>> tasks; // 保存任务
 
   public:
+    int getSize() const { return workers.size(); }
     explicit ThreadPool(int size) : stopped(false) { // 创建size个线程,消费者
         for (int i = 0; i < size; i++) {
             workers.emplace_back([this]() { // 不移动直接原地创建

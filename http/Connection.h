@@ -39,7 +39,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
         return now - _lastActive >= timeout;
     }
 
-    bool isfastresponse(const HttpRequest& req) const { return true; }
+    bool isfastresponse(const HttpRequest& req) const { return false; }
 
     int fd() const { return connfd; }
 

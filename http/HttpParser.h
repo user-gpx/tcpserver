@@ -63,7 +63,6 @@ class HttpParser { // 一个链接对应一个http解析器，保存解析的结
                     if (line.empty()) { // 空行表示请求头解析结束了
                         auto it = req.headers.find("content-length");
                         contentLength = it == req.headers.end() ? 0 : std::stoul(it->second);
-
                         if (contentLength == 0) { // 没有请求体
                             out = std::move(req);
                             reset();
@@ -73,14 +72,12 @@ class HttpParser { // 一个链接对应一个http解析器，保存解析的结
                         state = State::Body;
                         break;
                     }
-
                     if (!parseHeader(line)) return Result::Error;
                 }
             }
 
             if (state == State::Body) {
                 if (buf.size() < contentLength) return Result::Incomplete;
-
                 req.body.assign(reinterpret_cast<const char*>(buf.data()), contentLength);
                 buf.consume(contentLength);
                 out = std::move(req);
@@ -89,20 +86,17 @@ class HttpParser { // 一个链接对应一个http解析器，保存解析的结
             }
         }
     }
-
   private:
     void reset() {
         state = State::RequestLine;
         req = HttpRequest{};
         contentLength = 0;
     }
-
     static std::string lower(std::string s) {
         std::transform(s.begin(), s.end(), s.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return s;
     }
-
     static void trim(std::string& s) { // 去掉空白字符
         while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
             s.erase(s.begin());

@@ -314,10 +314,8 @@ int Connection::handlewrite() {
         } else {
             break;
         }
-
         if (!(_epoller.triggermode == TriggerMode::EdgeTrigger)) { break; }
     }
-
     if (outputbuffer.empty() && _epoller.modfd(connfd, EPOLLIN | baseevent) < 0) { return -1; }
     if (outputbuffer.empty() && _closeAfterWrite) return -1;
     return 0;
@@ -326,9 +324,7 @@ int Connection::handlewrite() {
 int Connection::try_one_request() {
     HttpRequest req;
     auto ret = parser.parse(inputbuffer, req);
-
     if (ret == HttpParser::Result::Incomplete) { return 0; }
-
     if (ret == HttpParser::Result::Error) {
         std::string resp = "HTTP/1.1 400 Bad Request\r\n"
                            "Content-Length: 11\r\n"
@@ -342,55 +338,47 @@ int Connection::try_one_request() {
         return 0;
     }
     _closeAfterWrite = !req.keepAlive();
-
-    if (isfastresponse(req)) {
+    if (isfastresponse(req)||pool.getSize() == 0) {//请请求或者是没有线程池了就直接在reactor线程处理，避免线程切换的开销。
         std::string resp = URL(req);
         bool fl = outputbuffer.empty();
         touch();
         outputbuffer.append(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
         if (fl && _epoller.modfd(connfd, EPOLLIN | EPOLLOUT | baseevent) < 0) { return -1; }
+        // 先检查flag再修改事件，避免重复修改事件导致性能下降。
     } else {
         _pendingReqs.push(std::move(req));
         if (!_isprocessing) { processNextSlowRequest(); }
     }
     return 1;
 }
-
 void Connection::processNextSlowRequest() {
     if (_pendingReqs.empty()) {
         _isprocessing = false;
         return;
     }
-
     _isprocessing = true;
     HttpRequest req = std::move(_pendingReqs.front());
     _pendingReqs.pop();
     std::weak_ptr<Connection> weak_self =
         shared_from_this(); // 这前面的一部分都是reactor线程处理的，真正耗时的请求处理放在线程池里执行，处理完了再通过ioqueue回到reactor线程更新socket状态和发送响应。
-
     pool.submit([weak_self, req = std::move(req)]() mutable {
         auto self = weak_self.lock();
         if (!self) { return; }
-
         std::string resp = self->URL(req); // 线程池真正处理的请求是这个。
-
         // Worker threads prepare the response, but socket and epoll updates stay on the reactor
         // thread.
         self->ioque.enqueue([weak_self,
                              resp = std::move(resp)]() mutable { // 加入回调队列，由reactor线程执行
             auto self = weak_self.lock();
             if (!self) { return; }
-
             bool fl = self->outputbuffer.empty();
             self->touch();
             self->outputbuffer.append(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
-
             bool arm_ok = true;
             if (fl) {
                 arm_ok =
                     self->_epoller.modfd(self->connfd, EPOLLIN | EPOLLOUT | self->baseevent) == 0;
             }
-
             self->_isprocessing = false;
             if (!arm_ok) { return; }
             self->processNextSlowRequest();
@@ -409,6 +397,13 @@ void Connection::send_response(const std::string& resp) {
 }
 
 std::string Connection::URL(const HttpRequest& req) {
+    // volatile int sum=0;
+    // for (int i = 0; i < 1000; i++) {
+    //     for (int j = 0; j < 100; j++) {
+    //         // 模拟慢请求，实际项目中这里可能是数据库查询或者其他耗时操作。
+    //         sum+= j % 100;
+    //     }
+    // }
     std::string path = request_path(req.path);
     if (req.method == "GET" && (path == "/" || path == "/index.html")) {
         std::string username = current_user(req);

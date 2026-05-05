@@ -1,16 +1,19 @@
 #include "Eventloop.h"
 
-int EventLoop::init(TriggerMode triggermode, int _listenfd, int connectionTimeoutMs) {
-    if (_epoller.create(triggermode) < 0) { return -1; }
+int EventLoop::init(TriggerMode listenTriggerMode, TriggerMode connTriggerMode, int listenfd,
+                    int connectionTimeoutMs, int poolSize) {
+    if (_epoller.create(connTriggerMode) < 0) { return -1; }
+    pool = std::make_unique<ThreadPool>(poolSize);
     ioque.init(_epoller.wakeupfd);
     connfdque.init(_epoller.wakeupfd);
-    this->_listenfd = _listenfd;
+    _listenfd = listenfd;
+    _listenTriggerMode = listenTriggerMode;
     _connectionTimeoutMs = connectionTimeoutMs;
     _lastTimeoutSweep = std::chrono::steady_clock::now();
 
     if (_listenfd >= 0) {
         uint32_t baseevent = EPOLLIN;
-        if (triggermode == TriggerMode::EdgeTrigger) { baseevent |= EPOLLET; }
+        if (_listenTriggerMode == TriggerMode::EdgeTrigger) { baseevent |= EPOLLET; }
         if (_epoller.addfd(_listenfd, baseevent) < 0) { return -1; }
     }
 
@@ -19,9 +22,9 @@ int EventLoop::init(TriggerMode triggermode, int _listenfd, int connectionTimeou
 
 bool EventLoop::acceptclient() {
     do {
-        sockaddr client_addr{};
+        sockaddr_in client_addr {};
         socklen_t addr_len = sizeof(client_addr);
-        int connfd = accept(_listenfd, &client_addr, &addr_len);
+        int connfd = accept(_listenfd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (connfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
@@ -38,6 +41,11 @@ bool EventLoop::acceptclient() {
             return false;
         }
 
+        char ip[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+        CLIENT_LOG_INFO("client connected fd=%d peer=%s:%u", connfd, ip,
+                        static_cast<unsigned>(ntohs(client_addr.sin_port)));
+
         if (N == 0) {
             uint32_t conn_events = EPOLLIN;
             if (_epoller.triggermode == TriggerMode::EdgeTrigger) { conn_events |= EPOLLET; }
@@ -49,19 +57,25 @@ bool EventLoop::acceptclient() {
         } else {
             subreactor[(lastsub++) % N].connfdque.enqueue(connfd);
         }
-    } while (_epoller.triggermode == TriggerMode::EdgeTrigger);
+    } while (_listenTriggerMode == TriggerMode::EdgeTrigger);
 
     return true;
 }
 
-int EventLoop::mainreacotloop(int N, TriggerMode triggermode) {
-    // 主reactor线程，负责accept连接和分发连接到subreactor线程
+int EventLoop::mainreacotloop(int N, TriggerMode listenTriggerMode, TriggerMode connTriggerMode,
+                              int poolSize) {
+    if (N < 0) {
+        LOG_ERROR("invalid subreactor count=%d", N);
+        return -1;
+    }
     this->N = N;
-    if (N == 0) { return loop(); } // N=0，不使用subreactor，主reactor线程自己处理所有连接
-    subreactor = new EventLoop[N];
-    int started = 0; // 已经成功启动的subreactor线程数量,用于出错时清理已经启动的线程
+    if (N == 0) { return loop(); }
+
+    subreactor = new EventLoop[static_cast<size_t>(N)];
+    int started = 0;
     for (int i = 0; i < N; i++) {
-        if (subreactor[i].init(triggermode, -1, _connectionTimeoutMs) < 0) {
+        if (subreactor[i].init(listenTriggerMode, connTriggerMode, -1, _connectionTimeoutMs,
+                               poolSize) < 0) {
             LOG_ERROR("subreactor init failed index=%d", i);
             uint64_t one = 1;
             for (int j = 0; j < started; ++j) {
@@ -87,11 +101,10 @@ int EventLoop::mainreacotloop(int N, TriggerMode triggermode) {
 int EventLoop::loop() {
     while (!_stop) {
         int n = _epoller.wait(events, _maxEvents, 1000);
-        // 超过1000ms没有事件就返回，进行一次超时连接检查
         if (n < 0) { return -1; }
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
-            
+
             if (_listenfd >= 0 && fd == _listenfd) {
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                     LOG_ERROR("listen fd error fd=%d events=0x%x", fd, events[i].events);
@@ -112,7 +125,7 @@ int EventLoop::loop() {
                     break;
                 }
 
-                std::queue<int> *que = connfdque.dequeue();
+                std::queue<int>* que = connfdque.dequeue();
                 while (!que->empty()) {
                     int connfd = que->front();
                     que->pop();
@@ -133,7 +146,7 @@ int EventLoop::loop() {
                     addConnection(connfd);
                 }
                 delete que;
-                
+
                 ioque.runTasks();
                 continue;
             }
@@ -162,18 +175,18 @@ int EventLoop::loop() {
             }
         }
 
-        closeIdleConnections(); // 检查是否有空闲连接超时需要关闭
+        closeIdleConnections();
     }
 
     return 0;
 }
 
 void EventLoop::close_connfd(int connfd, const char* reason) {
-    (void)reason;
     auto it = _connections.find(connfd);
     _epoller.delfd(connfd);
     close(connfd);
     if (it != _connections.end()) { _connections.erase(it); }
+    CLIENT_LOG_INFO("client closed fd=%d reason=%s", connfd, reason);
 }
 
 EventLoop::~EventLoop() {
@@ -203,16 +216,15 @@ void EventLoop::stop() {
 }
 
 void EventLoop::addConnection(int connfd) {
-    auto conn = std::make_shared<Connection>(connfd, _epoller, pool, ioque);
+    auto conn = std::make_shared<Connection>(connfd, _epoller, *pool, ioque);
     _connections[connfd] = std::move(conn);
 }
 
 void EventLoop::closeIdleConnections() {
-    if (_connectionTimeoutMs <= 0) { return; } // 超时时间小于等于0不检查超时连接
+    if (_connectionTimeoutMs <= 0) { return; }
 
-    auto now = std::chrono::steady_clock::now(); // 获取当前时间点
+    auto now = std::chrono::steady_clock::now();
     if (now - _lastTimeoutSweep < std::chrono::seconds(1)) { return; }
-    // 距离上次检查超时连接不到1秒就不检查了，避免频繁检查带来的性能消耗
     _lastTimeoutSweep = now;
 
     std::vector<int> expired;

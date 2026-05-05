@@ -4,7 +4,9 @@ main
 tools/load_test
 
 # runtime files
-logs/
+logs/*
+!logs/Logger.h
+!logs/Logger.cpp
 uploads/*
 
 # keep upload directory if needed

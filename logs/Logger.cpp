@@ -30,7 +30,6 @@ Logger& Logger::client() {
 
 bool Logger::init(const std::string& filePath) {
     std::lock_guard<std::mutex> lock(stateMutex);
-    ensureWorkerStarted();
     closeFilesLocked();
     this->filePath.clear();
     levelFilePaths.fill("");
@@ -43,7 +42,6 @@ bool Logger::init(const std::string& filePath) {
 bool Logger::initByLevel(const std::string& debugPath, const std::string& infoPath,
                          const std::string& warnPath, const std::string& errorPath) {
     std::lock_guard<std::mutex> lock(stateMutex);
-    ensureWorkerStarted();
     closeFilesLocked();
     filePath.clear();
     levelFilePaths = {debugPath, infoPath, warnPath, errorPath};
@@ -66,6 +64,14 @@ void Logger::setLevel(LogLevel level) {
 
 void Logger::setConsoleLevel(LogLevel level) {
     consoleMinLevel.store(level, std::memory_order_relaxed);
+}
+
+void Logger::setAsync(bool enabled) {
+    asyncMode.store(enabled, std::memory_order_relaxed);
+}
+
+void Logger::setEnabled(bool enabled) {
+    this->enabled.store(enabled, std::memory_order_relaxed);
 }
 
 void Logger::logf(LogLevel level, const char* file, int line, const char* func, const char* fmt,
@@ -105,15 +111,22 @@ void Logger::logv(LogLevel level, const char* file, int line, const char* func, 
                          static_cast<int>(consoleMinLevel.load(std::memory_order_relaxed)),
                      prefix + message + "\n"};
 
-    ensureWorkerStarted();
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        pendingLogs.push(std::move(entry));
+    if (asyncMode.load(std::memory_order_relaxed)) {
+        ensureWorkerStarted();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            pendingLogs.push(std::move(entry));
+        }
+        queueCv.notify_one();
+    } else {
+        std::vector<PendingLog> single;
+        single.push_back(std::move(entry));
+        writeBatch(single);
     }
-    queueCv.notify_one();
 }
 
 bool Logger::shouldLog(LogLevel level) const {
+    if (!enabled.load(std::memory_order_relaxed)) { return false; }
     return static_cast<int>(level) >=
            static_cast<int>(minLevel.load(std::memory_order_relaxed));
 }

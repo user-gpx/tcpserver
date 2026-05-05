@@ -1,6 +1,6 @@
 #pragma once
 #include "../common.h"
-#include "Logger.h"
+#include "../logs/Logger.h"
 
 #define LOG_ERR(msg)                                                                               \
     do {                                                                                           \

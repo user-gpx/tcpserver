@@ -29,6 +29,8 @@ class Logger {
                      const std::string& warnPath, const std::string& errorPath);
     void setLevel(LogLevel level);
     void setConsoleLevel(LogLevel level);
+    void setAsync(bool enabled);
+    void setEnabled(bool enabled);
     void logf(LogLevel level, const char* file, int line, const char* func, const char* fmt, ...);
     void logSystemError(const char* msg, int errnum, const char* file, int line, const char* func);
 
@@ -65,6 +67,8 @@ class Logger {
     std::array<FILE*, 4> levelFileHandles{{nullptr, nullptr, nullptr, nullptr}};
     std::atomic<LogLevel> minLevel{LogLevel::Info};
     std::atomic<LogLevel> consoleMinLevel{LogLevel::Info};
+    std::atomic<bool> asyncMode{true};
+    std::atomic<bool> enabled{true};
     std::string filePath;
     std::array<std::string, 4> levelFilePaths;
     std::queue<PendingLog> pendingLogs;
