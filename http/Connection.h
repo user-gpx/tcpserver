@@ -19,7 +19,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
     bool _isprocessing;
     std::queue<HttpRequest> _pendingReqs;
     std::chrono::steady_clock::time_point _lastActive;
-    bool _closeAfterWrite;//是否在写完响应后关闭连接
+    bool _closeAfterWrite; // 是否在写完响应后关闭连接
 
   public:
     Connection(int fd, Epoller& epoller, ThreadPool& pool, IoQueueContext& ioque);
@@ -30,8 +30,10 @@ class Connection : public std::enable_shared_from_this<Connection> {
     void processNextSlowRequest();
     void send_response(const std::string& resp);
 
-    void touch()//更新最后活跃时间
-     { _lastActive = std::chrono::steady_clock::now(); }
+    void touch() // 更新最后活跃时间
+    {
+        _lastActive = std::chrono::steady_clock::now();
+    }
 
     bool isTimedOut(std::chrono::steady_clock::time_point now,
                     std::chrono::milliseconds timeout) const {
@@ -39,7 +41,16 @@ class Connection : public std::enable_shared_from_this<Connection> {
         return now - _lastActive >= timeout;
     }
 
-    bool isfastresponse(const HttpRequest& req) const { return false; }
+    // bool isfastresponse(const HttpRequest& req) const { return false; }
+    bool isfastresponse(const HttpRequest& req) const {
+        std::string path = req.path;
+        if (req.method == "POST" && path == "/upload") { return false; }
+        if (req.method == "GET" && path == "/download") { return false; }
+        if (req.method == "POST" && path == "/register") { return false; }
+        if (req.method == "POST" && path == "/login") { return false; }
+        if (req.method == "GET" && path == "/api/images") { return false; }
+        return true;
+    }
 
     int fd() const { return connfd; }
 

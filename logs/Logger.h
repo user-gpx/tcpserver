@@ -67,11 +67,11 @@ class Logger {
     std::array<FILE*, 4> levelFileHandles{{nullptr, nullptr, nullptr, nullptr}};
     std::atomic<LogLevel> minLevel{LogLevel::Info};
     std::atomic<LogLevel> consoleMinLevel{LogLevel::Info};
-    std::atomic<bool> asyncMode{true};
-    std::atomic<bool> enabled{true};
-    std::string filePath;
+    std::atomic<bool> asyncMode{true};//默认异步日志
+    std::atomic<bool> enabled{true};//是否启用日志
+    std::string filePath;//日志文件路径
     std::array<std::string, 4> levelFilePaths;
-    std::queue<PendingLog> pendingLogs;
-    std::thread workerThread;
-    bool stopRequested{false};
+    std::queue<PendingLog> pendingLogs;//待写入的日志队列
+    std::thread workerThread;//日志写入线程，只有一个，负责异步写日志
+    bool stopRequested{false};//
 };

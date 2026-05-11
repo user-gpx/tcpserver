@@ -78,10 +78,10 @@ void Logger::logf(LogLevel level, const char* file, int line, const char* func, 
                   ...) {
     if (!shouldLog(level)) { return; }
 
-    va_list args;
-    va_start(args, fmt);
-    logv(level, file, line, func, fmt, args);
-    va_end(args);
+    va_list args;                             // 可变参数列表
+    va_start(args, fmt);                      // 初始化可变参数，从fmt后面开始访问。
+    logv(level, file, line, func, fmt, args); // 解析可变参数并记录日志
+    va_end(args);                             // 清理可变参数列表
 }
 
 void Logger::logSystemError(const char* msg, int errnum, const char* file, int line,
@@ -99,49 +99,52 @@ Logger::~Logger() {
 void Logger::logv(LogLevel level, const char* file, int line, const char* func, const char* fmt,
                   va_list args) {
     char message[kLogBufferSize];
-    vsnprintf(message, sizeof(message), fmt, args);
+    vsnprintf(message, sizeof(message), fmt,
+              args); // 将可变参数格式化为字符串，存储在message缓冲区中。
 
-    auto tid = static_cast<unsigned long long>(
-        std::hash<std::thread::id>{}(std::this_thread::get_id()));
-    std::string prefix = "[" + makeTimestamp() + "] [" + levelName(level) + "] [tid=" +
-                         std::to_string(tid) + "] " + file + ":" + std::to_string(line) + " " +
-                         func + "(): ";
+    auto tid = static_cast<unsigned long long>(std::hash<std::thread::id>{}(
+        std::this_thread::get_id())); // 获取当前线程ID并转换为无符号长长整数，以便在日志中使用。
+    std::string prefix = "[" + makeTimestamp() + "] [" + levelName(level) +
+                         "] [tid=" + std::to_string(tid) + "] " + file + ":" +
+                         std::to_string(line) + " " + func + "(): ";
     PendingLog entry{level,
                      static_cast<int>(level) >=
                          static_cast<int>(consoleMinLevel.load(std::memory_order_relaxed)),
                      prefix + message + "\n"};
 
-    if (asyncMode.load(std::memory_order_relaxed)) {
+    if (asyncMode.load(
+            std::
+                memory_order_relaxed)) { // 是异步日志模式，将日志条目添加到待处理队列并通知工作线程。
         ensureWorkerStarted();
         {
             std::lock_guard<std::mutex> lock(queueMutex);
-            pendingLogs.push(std::move(entry));
+            pendingLogs.push(std::move(entry)); // 压入待处理日志队列
         }
-        queueCv.notify_one();
+        queueCv.notify_one(); // 通知工作线程有新的日志条目需要处理
     } else {
-        std::vector<PendingLog> single;
-        single.push_back(std::move(entry));
-        writeBatch(single);
+        std::vector<PendingLog> single; // 同步日志模式，直接写入日志，不使用工作线程。
+        single.push_back(std::move(
+            entry)); // 虽然只有一个日志条目，但仍然使用writeBatch函数来写入日志，以保持代码的一致性。
+        writeBatch(single); // 直接写入日志
     }
 }
 
-bool Logger::shouldLog(LogLevel level) const {
+bool Logger::shouldLog(LogLevel level) const { // 检查是否应该记录给定级别的日志。
     if (!enabled.load(std::memory_order_relaxed)) { return false; }
-    return static_cast<int>(level) >=
-           static_cast<int>(minLevel.load(std::memory_order_relaxed));
+    return static_cast<int>(level) >= static_cast<int>(minLevel.load(std::memory_order_relaxed));
 }
 
-std::string Logger::makeTimestamp() const {
+std::string Logger::makeTimestamp()
+    const { // 生成当前时间的时间戳字符串，格式为"YYYY-MM-DD HH:MM:SS.mmm"，其中mmm是毫秒部分。
     auto now = std::chrono::system_clock::now();
-    auto ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
     std::time_t tt = std::chrono::system_clock::to_time_t(now);
 
     std::tm localTime{};
-#ifdef _WIN32
+#ifdef _WIN32 // Windows平台使用localtime_s函数将时间转换为本地时间。
     localtime_s(&localTime, &tt);
 #else
-    localtime_r(&tt, &localTime);
+    localtime_r(&tt, &localTime); // 类Unix平台使用localtime_r函数将时间转换为本地时间。
 #endif
 
     char timePart[32];
@@ -154,14 +157,10 @@ std::string Logger::makeTimestamp() const {
 
 const char* Logger::levelName(LogLevel level) const {
     switch (level) {
-    case LogLevel::Debug:
-        return "DEBUG";
-    case LogLevel::Info:
-        return "INFO";
-    case LogLevel::Warn:
-        return "WARN";
-    case LogLevel::Error:
-        return "ERROR";
+    case LogLevel::Debug: return "DEBUG";
+    case LogLevel::Info: return "INFO";
+    case LogLevel::Warn: return "WARN";
+    case LogLevel::Error: return "ERROR";
     }
     return "UNKNOWN";
 }
@@ -205,7 +204,7 @@ void Logger::ensureWorkerStarted() {
     std::lock_guard<std::mutex> lock(queueMutex);
     if (workerThread.joinable()) { return; }
     stopRequested = false;
-    workerThread = std::thread(&Logger::workerLoop, this);
+    workerThread = std::thread(&Logger::workerLoop, this); // 启动日志
 }
 
 void Logger::stopWorker() {
@@ -218,32 +217,31 @@ void Logger::stopWorker() {
 }
 
 void Logger::workerLoop() {
-    std::vector<PendingLog> batch;
+    // 日志写入线程的主循环，负责从待处理日志队列中取出日志条目并写入日志文件或控制台。
     while (true) {
-        {
+        std::queue<PendingLog> logsToProcess;
+        { // 锁范围
             std::unique_lock<std::mutex> lock(queueMutex);
             queueCv.wait(lock, [this] { return stopRequested || !pendingLogs.empty(); });
-            if (stopRequested && pendingLogs.empty()) { break; }
-
-            batch.clear();
-            batch.reserve(pendingLogs.size());
-            while (!pendingLogs.empty()) {
-                batch.push_back(std::move(pendingLogs.front()));
-                pendingLogs.pop();
-            }
+            if (stopRequested && pendingLogs.empty()) break;
+            logsToProcess.swap(pendingLogs); // O(1) 交换，锁内操作最短
+        } // 释放锁
+        // 锁外生成 vector 批量写
+        std::vector<PendingLog> batch;
+        batch.reserve(logsToProcess.size());
+        while (!logsToProcess.empty()) {
+            batch.push_back(std::move(logsToProcess.front()));
+            logsToProcess.pop();
         }
-
-        writeBatch(batch);
+        writeBatch(batch); // 批量写日志
     }
 }
 
 void Logger::writeBatch(const std::vector<PendingLog>& batch) {
     std::lock_guard<std::mutex> lock(stateMutex);
-
     bool wroteStderr = false;
     bool wroteSharedFile = false;
     std::array<bool, 4> touchedLevelFiles{{false, false, false, false}};
-
     for (const PendingLog& entry : batch) {
         if (entry.writeConsole) {
             fwrite(entry.line.data(), 1, entry.line.size(), stderr);
@@ -260,7 +258,6 @@ void Logger::writeBatch(const std::vector<PendingLog>& batch) {
             wroteSharedFile = true;
         }
     }
-
     if (wroteStderr) { fflush(stderr); }
     if (wroteSharedFile) { fflush(fileHandle); }
     for (size_t i = 0; i < levelFileHandles.size(); ++i) {
@@ -268,4 +265,6 @@ void Logger::writeBatch(const std::vector<PendingLog>& batch) {
     }
 }
 
-size_t Logger::levelIndex(LogLevel level) const { return static_cast<size_t>(level); }
+size_t Logger::levelIndex(LogLevel level) const {
+    return static_cast<size_t>(level);
+}

@@ -13,6 +13,8 @@
 - 支持长连接和短连接
 - Cookie session 登录状态
 - 注册、登录、退出
+- MySQL 保存用户和上传文件记录
+- 密码加盐 hash 后入库，不保存明文密码
 - 上传图片到 `uploads/`
 - 上传文件按原文件名加时间戳保存，避免固定文件名互相覆盖
 - `/api/images` 返回可下载图片列表
@@ -37,6 +39,12 @@ TCPServer/
 │   ├── Connection.h
 │   ├── Connection.cpp
 │   └── HttpParser.h
+├── db/
+│   ├── MySQLStore.h
+│   ├── MySQLStore.cpp
+│   ├── PasswordHash.h
+│   ├── PasswordHash.cpp
+│   └── schema.sql
 ├── static/
 │   ├── index.html
 │   ├── login.html
@@ -72,11 +80,20 @@ make
 
 ```text
 main.cpp
+config.cpp
+db/MySQLStore.cpp
+db/PasswordHash.cpp
 http/Connection.cpp
 reactor/Eventloop.cpp
 reactor/Epoller.cpp
 logs/Logger.cpp
 utils/Buffer.cpp
+```
+
+需要安装 MySQL 客户端开发库和 OpenSSL 开发库，例如：
+
+```bash
+sudo apt install libmysqlclient-dev libssl-dev
 ```
 
 清理：
@@ -90,7 +107,7 @@ make clean
 启动格式：
 
 ```bash
-./main [-p port] [-M mode] [-N count] [-S poolsize] [-l 0|1] [-c 0|1] [-T 0..3]
+./main [-p port] [-M mode] [-N count] [-S poolsize] [-l 0|1] [-c 0|1] [-T 0..3] [--db-host host] [--db-port port] [--db-user user] [--db-password password] [--db-name name]
 ```
 
 参数必须用空格分隔，例如 `-p 9006`，不能写成 `-p9006`。
@@ -104,6 +121,11 @@ make clean
 | `-l` | 日志写入方式：`0` 同步，`1` 异步 | `1` |
 | `-c` | 是否关闭日志：`0` 开启，`1` 关闭 | `0` |
 | `-T` | 触发组合：`0` LT/LT，`1` LT/ET，`2` ET/LT，`3` ET/ET | `3` |
+| `--db-host` | MySQL 主机 | `127.0.0.1` |
+| `--db-port` | MySQL 端口 | `3306` |
+| `--db-user` | MySQL 用户 | `tcpserver` |
+| `--db-password` | MySQL 密码 | `123456` |
+| `--db-name` | MySQL 数据库名 | `tcpserver` |
 
 `-N` 的具体含义：
 
@@ -120,6 +142,41 @@ make clean
 ./main -p 9006 -N 4 -M 1
 ./main -p 9006 -M 0 -N 4 -S 8 -l 1 -c 0 -T 3
 ```
+
+## MySQL
+
+服务器会在第一次访问数据库时自动创建数据库和表。数据库连接参数由 `Config` 解析，默认值如下：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--db-host` | `127.0.0.1` | MySQL 主机 |
+| `--db-port` | `3306` | MySQL 端口 |
+| `--db-user` | `tcpserver` | MySQL 用户 |
+| `--db-password` | `123456` | MySQL 密码 |
+| `--db-name` | `tcpserver` | 数据库名 |
+
+如果本机 root 不能免密访问，可以先创建专用用户：
+
+```sql
+CREATE DATABASE IF NOT EXISTS tcpserver DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'tcpserver'@'localhost' IDENTIFIED BY 'your_password';
+GRANT ALL PRIVILEGES ON tcpserver.* TO 'tcpserver'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+启动时可以直接指定数据库参数：
+
+```bash
+./main -p 9006 --db-host 127.0.0.1 --db-user tcpserver --db-password your_password --db-name tcpserver
+```
+
+建表 SQL 也保存在：
+
+```text
+db/schema.sql
+```
+
+当前注册和登录仍通过 HTTP 表单提交，传输层仍是明文；服务端收到密码后会加盐 hash，数据库只保存 `password_hash`，不会保存明文密码。生产环境仍应使用 HTTPS。
 
 ## Web 页面
 
@@ -356,6 +413,6 @@ wrk -t2 -c1000 -d20s http://localhost:9006
 
 - 用户和 session 当前保存在进程内存中，服务重启后会丢失。
 - 图片文件保存在本地 `uploads/` 目录。
-- 当前密码处理是示例级实现，不适合作为生产环境认证方案。
+- 当前密码传输仍是 HTTP 明文；数据库不保存明文密码，但生产环境必须使用 HTTPS。
 - 项目依赖 Linux / WSL 环境。
 - 高并发短连接压测时，`listen` backlog、`ulimit -n`、`somaxconn`、`tcp_max_syn_backlog` 都可能影响结果。

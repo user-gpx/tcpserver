@@ -35,14 +35,12 @@ bool EventLoop::acceptclient() {
                 return false;
             }
         }
-
-        if (setNonBlock(connfd) < 0) {
+        if (setNonBlock(connfd) < 0) {//设置非阻塞失败，关闭连接并继续接受下一个连接
             close(connfd);
             return false;
         }
-
         char ip[INET_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));//将网络字节序的IP地址转换为点分十进制字符串
         CLIENT_LOG_INFO("client connected fd=%d peer=%s:%u", connfd, ip,
                         static_cast<unsigned>(ntohs(client_addr.sin_port)));
 
@@ -54,7 +52,7 @@ bool EventLoop::acceptclient() {
                 return false;
             }
             addConnection(connfd);
-        } else {
+        } else {//分发给子reactor
             subreactor[(lastsub++) % N].connfdque.enqueue(connfd);
         }
     } while (_listenTriggerMode == TriggerMode::EdgeTrigger);
@@ -69,10 +67,9 @@ int EventLoop::mainreacotloop(int N, TriggerMode listenTriggerMode, TriggerMode 
         return -1;
     }
     this->N = N;
-    if (N == 0) { return loop(); }
-
+    if (N == 0) { return loop(); }//单reactor模式
     subreactor = new EventLoop[static_cast<size_t>(N)];
-    int started = 0;
+    int started = 0;//记录成功启动的子reactor数量，以便出错时正确清理资源
     for (int i = 0; i < N; i++) {
         if (subreactor[i].init(listenTriggerMode, connTriggerMode, -1, _connectionTimeoutMs,
                                poolSize) < 0) {
@@ -94,17 +91,16 @@ int EventLoop::mainreacotloop(int N, TriggerMode listenTriggerMode, TriggerMode 
         _threads.emplace_back([this, i] { subreactor[i].loop(); });
         started++;
     }
-
     return loop();
 }
 
 int EventLoop::loop() {
     while (!_stop) {
         int n = _epoller.wait(events, _maxEvents, 1000);
+        //超时值设置为1000ms，确保每秒至少检查一次连接超时
         if (n < 0) { return -1; }
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
-
             if (_listenfd >= 0 && fd == _listenfd) {
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                     LOG_ERROR("listen fd error fd=%d events=0x%x", fd, events[i].events);
@@ -114,7 +110,6 @@ int EventLoop::loop() {
                 }
                 continue;
             }
-
             if (fd == _epoller.wakeupfd) {
                 uint64_t one;
                 while (true) {
@@ -124,17 +119,15 @@ int EventLoop::loop() {
                     if (rv < 0) { LOG_ERR("read(wakeupfd)"); }
                     break;
                 }
-
+                //从队列中取出所有新连接的fd，并添加到epoll监听中。已实现线程安全
                 std::queue<int>* que = connfdque.dequeue();
                 while (!que->empty()) {
                     int connfd = que->front();
                     que->pop();
-
                     if (setNonBlock(connfd) < 0) {
                         close(connfd);
                         continue;
                     }
-
                     uint32_t conn_events = EPOLLIN;
                     if (_epoller.triggermode == TriggerMode::EdgeTrigger) {
                         conn_events |= EPOLLET;
@@ -146,16 +139,14 @@ int EventLoop::loop() {
                     addConnection(connfd);
                 }
                 delete que;
-
+                //执行线程池提交的任务，如处理慢请求的回调等。已实现线程安全
                 ioque.runTasks();
                 continue;
             }
-
             if (events[i].events & (EPOLLHUP | EPOLLERR)) {
                 close_connfd(fd, "epoll hup/error");
                 continue;
             }
-
             if (events[i].events & EPOLLIN) {
                 auto it = _connections.find(fd);
                 if (it == _connections.end()) { continue; }
@@ -164,7 +155,6 @@ int EventLoop::loop() {
                     continue;
                 }
             }
-
             if (events[i].events & EPOLLOUT) {
                 auto it = _connections.find(fd);
                 if (it == _connections.end()) { continue; }
@@ -220,14 +210,14 @@ void EventLoop::addConnection(int connfd) {
     _connections[connfd] = std::move(conn);
 }
 
-void EventLoop::closeIdleConnections() {
+void EventLoop::closeIdleConnections() {//定期检查并关闭空闲连接。。考虑改成最小堆来优化性能
     if (_connectionTimeoutMs <= 0) { return; }
 
     auto now = std::chrono::steady_clock::now();
     if (now - _lastTimeoutSweep < std::chrono::seconds(1)) { return; }
     _lastTimeoutSweep = now;
 
-    std::vector<int> expired;
+    std::vector<int> expired;//保存超时连接的fd，避免在遍历_connections时修改它
     expired.reserve(_connections.size());
 
     for (const auto& [fd, conn] : _connections) {

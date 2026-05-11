@@ -1,5 +1,8 @@
 #include "Connection.h"
 
+#include "../db/MySQLStore.h"
+#include "../db/PasswordHash.h"
+
 #include <algorithm>
 #include <cctype>
 #include <ctime>
@@ -12,8 +15,14 @@
 
 namespace {
 std::mutex g_authMutex;
-std::unordered_map<std::string, std::string> g_users;
-std::unordered_map<std::string, std::string> g_sessions;
+struct SessionInfo {
+    long long userId{0};
+    std::string username;
+};
+
+std::unordered_map<std::string, SessionInfo> g_sessions;
+// 在内存中保存session：
+// 键是session id，值是SessionInfo结构体，包含用户id和用户名。
 
 int hex_value(char ch) {
     if (ch >= '0' && ch <= '9') { return ch - '0'; }
@@ -88,9 +97,9 @@ std::string request_path(const std::string& target) {
 }
 
 std::string get_cookie_value(const HttpRequest& req, const std::string& name) {
+    // 从请求头中的cookie中获取指定name的值
     auto it = req.headers.find("cookie");
     if (it == req.headers.end()) { return ""; }
-
     std::string cookie = it->second;
     size_t start = 0;
     while (start < cookie.size()) {
@@ -106,16 +115,25 @@ std::string get_cookie_value(const HttpRequest& req, const std::string& name) {
     return "";
 }
 
-std::string current_user(const HttpRequest& req) {
-    std::string sid = get_cookie_value(req, "SID");
-    if (sid.empty()) { return ""; }
-
+SessionInfo current_session(const HttpRequest& req) { // 获取当前请求（当前连接）的session信息
+    std::string sid = get_cookie_value(
+        req,
+        "SID"); // 从请求头中的cookie中获取SID，找到对应的session信息，返回用户id和用户名。如果没有SID或者SID无效，就返回空的SessionInfo。
+    if (sid.empty()) { return {}; }
     std::lock_guard<std::mutex> lock(g_authMutex);
-    auto it = g_sessions.find(sid);
-    return it == g_sessions.end() ? "" : it->second;
+    auto it = g_sessions.find(
+        sid); // 从全局session表中查找SID对应的session信息，使用互斥锁保护访问，防止多线程同时修改session表导致数据不一致。
+    return it == g_sessions.end() ? SessionInfo{} : it->second;
+}
+
+std::string current_user(const HttpRequest& req) {
+    return current_session(req)
+        .username; // 获取当前请求的用户名，如果没有登录就返回空字符串。通过调用current_session函数获取session信息，再从session信息中获取用户名。
 }
 
 std::string make_session_id() {
+    // 生成session
+    // id，使用随机数生成器生成一个随机的64位整数，并转换成16进制字符串。使用thread_local保证每个线程有自己的随机数生成器，避免多线程竞争导致性能下降。
     static thread_local std::mt19937_64 rng(std::random_device{}());
     std::ostringstream oss;
     oss << std::hex << rng() << rng();
@@ -223,13 +241,14 @@ std::vector<std::string> list_uploaded_images() {
     return files;
 }
 
-std::string image_list_json() {
+std::string image_list_json(long long userId) {
     std::string body = "[";
-    auto files = list_uploaded_images();
+    auto files = MySQLStore::instance().listFiles(userId);
     for (size_t i = 0; i < files.size(); ++i) {
         if (i > 0) { body += ","; }
-        body += "{\"name\":\"" + json_escape(files[i]) +
-                "\",\"url\":\"/download?file=" + url_encode(files[i]) + "\"}";
+        body += "{\"name\":\"" + json_escape(files[i].storedName) + "\",\"original_name\":\"" +
+                json_escape(files[i].originalName) +
+                "\",\"url\":\"/download?file=" + url_encode(files[i].storedName) + "\"}";
     }
     body += "]";
     return body;
@@ -288,7 +307,6 @@ int Connection::handleread() {
                 return -1;
             }
         }
-
         if (!(_epoller.triggermode == TriggerMode::EdgeTrigger)) { break; }
     }
     while (true) {
@@ -302,9 +320,8 @@ int Connection::handleread() {
 int Connection::handlewrite() {
     while (!outputbuffer.empty()) {
         ssize_t n = write(connfd, outputbuffer.data(), outputbuffer.size());
-
         if (n > 0) {
-            touch();
+            touch(); // 更新活跃时间
             outputbuffer.consume(n);
         } else if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) { break; }
@@ -338,8 +355,9 @@ int Connection::try_one_request() {
         return 0;
     }
     _closeAfterWrite = !req.keepAlive();
-    if (isfastresponse(req)||pool.getSize() == 0) {//请请求或者是没有线程池了就直接在reactor线程处理，避免线程切换的开销。
-        std::string resp = URL(req);
+    if (isfastresponse(req) || pool.getSize() == 0) {
+        // 请请求或者是线程池大小为0，就直接在reactor线程处理，避免线程切换的开销。
+        std::string resp = URL(req); // 获取响应
         bool fl = outputbuffer.empty();
         touch();
         outputbuffer.append(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
@@ -348,45 +366,47 @@ int Connection::try_one_request() {
     } else {
         _pendingReqs.push(std::move(req));
         if (!_isprocessing) { processNextSlowRequest(); }
+        // 只有在没有线程池处理时才调用，防止多个线程池处理一个连接。
     }
     return 1;
 }
 void Connection::processNextSlowRequest() {
     if (_pendingReqs.empty()) {
-        _isprocessing = false;
+        _isprocessing = false; // 处理完了，设置为false，下次有请求了再设置为true并提交到线程池。
         return;
     }
     _isprocessing = true;
     HttpRequest req = std::move(_pendingReqs.front());
     _pendingReqs.pop();
-    std::weak_ptr<Connection> weak_self =
-        shared_from_this(); // 这前面的一部分都是reactor线程处理的，真正耗时的请求处理放在线程池里执行，处理完了再通过ioqueue回到reactor线程更新socket状态和发送响应。
+    std::weak_ptr<Connection> weak_self = shared_from_this();
+    // 这前面的一部分都是reactor线程处理的，真正耗时的请求处理放在线程池里执行
+    // 处理完了再通过ioqueue回到reactor线程更新socket状态和发送响应。
     pool.submit([weak_self, req = std::move(req)]() mutable {
-        auto self = weak_self.lock();
+        auto self = weak_self.lock(); // 弱指针加锁获取shared_ptr，获取失败说明连接已经关闭了。
         if (!self) { return; }
         std::string resp = self->URL(req); // 线程池真正处理的请求是这个。
-        // Worker threads prepare the response, but socket and epoll updates stay on the reactor
-        // thread.
-        self->ioque.enqueue([weak_self,
-                             resp = std::move(resp)]() mutable { // 加入回调队列，由reactor线程执行
+        auto func = [weak_self,
+                     resp = std::move(resp)]() mutable { // 并不会执行，只是创建一个函数对象。
             auto self = weak_self.lock();
             if (!self) { return; }
             bool fl = self->outputbuffer.empty();
             self->touch();
             self->outputbuffer.append(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
             bool arm_ok = true;
-            if (fl) {
+            if (fl) { // 只有在写入前是空的才会监听可写事件，避免重复修改事件导致性能下降。
                 arm_ok =
                     self->_epoller.modfd(self->connfd, EPOLLIN | EPOLLOUT | self->baseevent) == 0;
             }
             self->_isprocessing = false;
             if (!arm_ok) { return; }
             self->processNextSlowRequest();
-        });
+            // 可能还有请求，继续处理下一个请求。递归调用
+        };
+        self->ioque.enqueue(func); // 将要执行的函数加入回调队列，由reactor线程执行
     });
 }
 
-void Connection::send_response(const std::string& resp) {
+void Connection::send_response(const std::string& resp) { // 现在并没有使用
     auto iofunc = [this, resp = std::string(resp)]() mutable {
         bool fl = outputbuffer.empty();
         touch();
@@ -397,17 +417,11 @@ void Connection::send_response(const std::string& resp) {
 }
 
 std::string Connection::URL(const HttpRequest& req) {
-    // volatile int sum=0;
-    // for (int i = 0; i < 1000; i++) {
-    //     for (int j = 0; j < 100; j++) {
-    //         // 模拟慢请求，实际项目中这里可能是数据库查询或者其他耗时操作。
-    //         sum+= j % 100;
-    //     }
-    // }
     std::string path = request_path(req.path);
-    if (req.method == "GET" && (path == "/" || path == "/index.html")) {
+    if (req.method == "GET" && (path == "/" || path == "/index.html")) {//主页，必须先登录
         std::string username = current_user(req);
         if (username.empty()) { return redirect_response("/login", req.keepAlive()); }
+        //如果没有登录就重定向到登录页
         return make_home_page(req.keepAlive());
     }
     if (req.method == "GET" && path == "/login") {
@@ -418,7 +432,6 @@ std::string Connection::URL(const HttpRequest& req) {
         }
         return make_response(200, "OK", "text/html; charset=utf-8", body, req.keepAlive());
     }
-
     if (req.method == "GET" && path == "/register") {
         std::string body = read_file("static/register.html");
         if (body.empty()) {
@@ -427,63 +440,58 @@ std::string Connection::URL(const HttpRequest& req) {
         }
         return make_response(200, "OK", "text/html; charset=utf-8", body, req.keepAlive());
     }
-
-    if (req.method == "POST" && path == "/register") {
-        auto fields = parse_form(req.body);
+    if (req.method == "POST" && path == "/register") { // 注册请求
+        auto fields = parse_form(req.body);            // 解析表单数据，获取用户名和密码
         std::string username = fields["username"];
         std::string password = fields["password"];
-
         if (username.empty() || password.empty()) {
             return make_response(400, "Bad Request", "text/plain", "username or password empty",
                                  req.keepAlive());
         }
-
-        {
-            std::lock_guard<std::mutex> lock(g_authMutex);
-            if (g_users.find(username) != g_users.end()) {
-                return make_response(409, "Conflict", "text/plain", "username exists",
-                                     req.keepAlive());
-            }
-            g_users[username] = password;
+        UserRecord existing;
+        MySQLStore& db = MySQLStore::instance(); // 获取数据库实例
+        if (!db.ensureReady()) {                 // 确保数据库连接可用
+            return make_response(500, "Internal Server Error", "text/plain", "database unavailable",
+                                 req.keepAlive());
         }
-
-        return redirect_response("/login", req.keepAlive());
+        if (db.findUser(username, existing)) {
+            return make_response(409, "Conflict", "text/plain", "username exists", req.keepAlive());
+        }
+        if (!db.createUser(username, makePasswordHash(password))) {
+            return make_response(500, "Internal Server Error", "text/plain", "create user failed",
+                                 req.keepAlive());
+        }
+        return redirect_response("/login", req.keepAlive()); // 注册完了，重定向到登录页
     }
-
-    if (req.method == "POST" && path == "/login") {
+    if (req.method == "POST" && path == "/login") { // 登录请求
         auto fields = parse_form(req.body);
         std::string username = fields["username"];
         std::string password = fields["password"];
-
-        bool ok = false;
-        {
-            std::lock_guard<std::mutex> lock(g_authMutex);
-            auto it = g_users.find(username);
-            ok = it != g_users.end() && it->second == password;
-        }
-
-        if (!ok) {
-            return make_response(401, "Unauthorized", "text/plain", "bad username or password",
+        UserRecord user;
+        MySQLStore& db = MySQLStore::instance();//
+        if (!db.ensureReady()) {
+            return make_response(500, "Internal Server Error", "text/plain", "database unavailable",
                                  req.keepAlive());
         }
-
-        std::string sid = make_session_id();
+        if (!db.findUser(username, user) || !verifyPassword(password, user.passwordHash)) {
+            return make_response(401, "Unauthorized", "text/plain", "bad username or password",
+                                 req.keepAlive());//简单回复，没有使用静态文件
+        }
+        std::string sid = make_session_id(); // 生成
         {
             std::lock_guard<std::mutex> lock(g_authMutex);
-            g_sessions[sid] = username;
+            g_sessions[sid] = SessionInfo{user.id, user.username};//填入
         }
-
         return redirect_response("/", req.keepAlive(),
                                  "Set-Cookie: SID=" + sid + "; Path=/; HttpOnly\r\n");
     }
 
-    if (req.method == "GET" && path == "/logout") {
+    if (req.method == "GET" && path == "/logout") { // 登出请求
         std::string sid = get_cookie_value(req, "SID");
         if (!sid.empty()) {
             std::lock_guard<std::mutex> lock(g_authMutex);
             g_sessions.erase(sid);
         }
-
         return redirect_response("/login", req.keepAlive(),
                                  "Set-Cookie: SID=; Path=/; Max-Age=0; HttpOnly\r\n");
     }
@@ -491,14 +499,16 @@ std::string Connection::URL(const HttpRequest& req) {
     if (req.method == "POST" && path == "/upload") { return handle_upload(req); }
 
     if (req.method == "GET" && path == "/api/images") {
-        if (current_user(req).empty()) { return redirect_response("/login", req.keepAlive()); }
+        SessionInfo session = current_session(req);
+        if (session.username.empty()) { return redirect_response("/login", req.keepAlive()); }
 
-        return make_response(200, "OK", "application/json; charset=utf-8", image_list_json(),
-                             req.keepAlive());
+        return make_response(200, "OK", "application/json; charset=utf-8",
+                             image_list_json(session.userId), req.keepAlive());
     }
 
     if (req.method == "GET" && path == "/download") {
-        if (current_user(req).empty()) { return redirect_response("/login", req.keepAlive()); }
+        SessionInfo session = current_session(req);
+        if (session.username.empty()) { return redirect_response("/login", req.keepAlive()); }
 
         auto query = parse_query(req.path);
         std::string filename = sanitize_filename(query["file"]);
@@ -506,17 +516,21 @@ std::string Connection::URL(const HttpRequest& req) {
             return make_response(400, "Bad Request", "text/plain", "bad filename", req.keepAlive());
         }
 
-        std::string body = read_file("uploads/" + filename);
+        FileRecord file;
+        if (!MySQLStore::instance().findFile(session.userId, filename, file)) {
+            return make_response(404, "Not Found", "text/plain", "image not found",
+                                 req.keepAlive());
+        }
+        std::string body = read_file(file.storedPath);
         if (body.empty()) {
             return make_response(404, "Not Found", "text/plain", "image not found",
                                  req.keepAlive());
         }
 
         return response_with_extra_headers(
-            200, "OK", image_content_type(filename), body, req.keepAlive(),
-            "Content-Disposition: attachment; filename=\"" + filename + "\"\r\n");
+            200, "OK", image_content_type(file.storedName), body, req.keepAlive(),
+            "Content-Disposition: attachment; filename=\"" + file.originalName + "\"\r\n");
     }
-
     return make_response(404, "Not Found", "text/plain", "404 not found", req.keepAlive());
 }
 
@@ -567,8 +581,8 @@ std::string Connection::make_home_page(bool keep_alive) {
 }
 
 std::string Connection::handle_upload(const HttpRequest& req) {
-    std::string username = current_user(req);
-    if (username.empty()) { return redirect_response("/login", req.keepAlive()); }
+    SessionInfo session = current_session(req);
+    if (session.username.empty()) { return redirect_response("/login", req.keepAlive()); }
 
     auto it = req.headers.find("content-type");
     if (it == req.headers.end()) {
@@ -601,7 +615,9 @@ std::string Connection::handle_upload(const HttpRequest& req) {
     if (end >= 2 && body[end - 2] == '\r' && body[end - 1] == '\n') { end -= 2; }
 
     std::string filedata = body.substr(start, end - start);
-    std::string filename = "uploads/" + make_saved_filename(multipart_filename(part_header));
+    std::string originalName = sanitize_filename(multipart_filename(part_header));
+    std::string storedName = make_saved_filename(originalName);
+    std::string filename = "uploads/" + storedName;
 
     FILE* fp = fopen(filename.c_str(), "wb");
     if (!fp) {
@@ -621,6 +637,17 @@ std::string Connection::handle_upload(const HttpRequest& req) {
     if (fclose(fp) != 0) {
         LOG_ERR("fclose(upload_file)");
         return make_response(500, "Internal Server Error", "text/plain", "close file failed",
+                             req.keepAlive());
+    }
+
+    FileRecord file;
+    file.originalName = originalName;
+    file.storedName = storedName;
+    file.storedPath = filename;
+    file.size = filedata.size();
+    file.contentType = image_content_type(storedName);
+    if (!MySQLStore::instance().addFile(session.userId, file)) {
+        return make_response(500, "Internal Server Error", "text/plain", "save file record failed",
                              req.keepAlive());
     }
 
